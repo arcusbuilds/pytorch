@@ -472,7 +472,6 @@ class GraphLowering(torch.fx.Interpreter):
         self.additional_buffer_deps: dict[str, OrderedSet[str]] = defaultdict(
             OrderedSet
         )
-        self.additional_star_deps: dict[str, OrderedSet[str]] = defaultdict(OrderedSet)
         # Maps control_deps FX node to operation names created when lowering it,
         # for void ops (e.g. record_event) that return None and therefore cannot
         # be referenced by name in subsequent control_deps ordering constraints.

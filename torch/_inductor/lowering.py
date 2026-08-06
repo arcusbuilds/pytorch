@@ -9416,8 +9416,13 @@ def with_effects(token, op, *args, **kwargs):
             wrap_tensors, ir.FallbackKernel.create(op, *args, **kwargs)
         )
 
-    # Get all the operations created during the lowering above, and add StarDeps
-    # to the previous node with the same effect
+    # Get all the operations created during the lowering above, and order them
+    # after the previous op with the same effect. This is an ordering constraint
+    # only: an effect edge says nothing about whether this op reads the previous
+    # one's buffer, so it goes through additional_buffer_deps, which the
+    # scheduler installs as WeakDep(is_fake=True). A strong dep would be counted
+    # as a real read and would extend the previous buffer's lifetime past its
+    # last true use, defeating both reuse and deallocation.
     if len(V.graph.operations[operation_len:]) <= 0:
         raise AssertionError(
             f"No operation nodes were generated when lowering effectful operator {op}."
@@ -9428,8 +9433,12 @@ def with_effects(token, op, *args, **kwargs):
             # Patch has_side_effects to return True
             new_op.has_side_effects = lambda: True  # pyrefly: ignore[missing-attribute]
             if prev_effect_buffer:
-                op_name = new_op.get_name()  # pyrefly: ignore[missing-attribute]
-                V.graph.additional_star_deps[op_name].add(prev_effect_buffer.get_name())
+                op_name = (
+                    new_op.get_operation_name()
+                )  # pyrefly: ignore[missing-attribute]
+                V.graph.additional_buffer_deps[op_name].add(
+                    prev_effect_buffer.get_name()
+                )
         # Update the effectful ops chain to point to the latest operation
         V.graph.effectful_ops[effect_type] = (
             new_op  # pyrefly: ignore[unsupported-operation]
