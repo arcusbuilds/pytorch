@@ -25,6 +25,7 @@ import platform
 import shutil
 import sys
 import types
+import weakref
 from collections.abc import Callable, Generator, Iterator
 from contextlib import nullcontext
 from typing import Any, NewType, Optional, TYPE_CHECKING, Union
@@ -40,6 +41,7 @@ from .bytecode_transformation import (
     get_code_keys,
     is_compiled_fn_name,
 )
+from .types import FrameAction, FrameExecStrategy
 from .utils import CleanupHook, counters, dynamo_timed, increment_frame
 
 
@@ -51,6 +53,10 @@ if TYPE_CHECKING:
 
 
 _CODE_CACHE = WeakIdKeyDictionary()
+
+# code object -> the live CompilePackages that installed entries on it. Weak on
+# both sides: a package dropped without unloading must not block a later one.
+_PRECOMPILE_INSTALLERS: WeakIdKeyDictionary = WeakIdKeyDictionary()
 
 
 def _code_cache(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -637,6 +643,15 @@ class CompilePackage:
 
         self._current_entry: _DynamoCodeCacheEntry | None = None
         self._installed_globals: dict[types.ModuleType, list[str]] = {}
+        # Code objects we registered precompile entries on, so uninstall() can
+        # clear all of them. install() covers resume functions and any frame
+        # reached through code_source, not just the entry frame.
+        self._installed_precompile_codes: list[types.CodeType] = []
+        self._skipped_codes: list[types.CodeType] = []
+        # Frames whose capture was cut short by the recompile limit. Deliberately
+        # runtime-only and NOT serialized: it describes this capture session, not
+        # the artifact, and it must not affect what install() serves.
+        self._truncated_frames: set[str] = set()
         # device_type that model compiled with.
         self._device_type = "cpu"
 
@@ -800,6 +815,29 @@ class CompilePackage:
     def update_device_type(self, graph: torch.fx.Graph | None) -> None:
         self._device_type = _graph_device_type(graph)
 
+    def has_current_entry(self) -> bool:
+        return self._current_entry is not None
+
+    def mark_current_entry_truncated(self) -> None:
+        """
+        Record that this frame hit the recompile limit, so callers building an
+        artifact can tell the capture is missing variants. Unlike bypassing, the
+        variants already captured stay installable -- a truncated frame still
+        serves what it covers and recompiles for the rest.
+        """
+        if self._current_entry is None:
+            raise AssertionError(
+                "_current_entry is not set in mark_current_entry_truncated"
+            )
+        code = self._current_entry.python_code
+        self._truncated_frames.add(
+            f"{code.co_name} ({code.co_filename}:{code.co_firstlineno})"
+        )
+
+    @property
+    def truncated_frames(self) -> frozenset[str]:
+        return frozenset(self._truncated_frames)
+
     def bypass_current_entry(self) -> None:
         if self._current_entry is None:
             raise AssertionError("_current_entry is not set in bypass_current_entry")
@@ -872,7 +910,37 @@ class CompilePackage:
 
         self._installed_globals = {}
 
-        _reset_precompile_entries(self._innermost_fn.__code__)
+        for code in self._skipped_codes:
+            torch._dynamo.eval_frame.set_code_exec_strategy(
+                code, FrameExecStrategy(FrameAction.DEFAULT, FrameAction.DEFAULT)
+            )
+        self._skipped_codes = []
+
+        # _reset_precompile_entries clears every entry on a code object and there
+        # is no per-entry removal, so unloading also drops any other live
+        # package's entries for the same frame. Warn rather than raise: refusing
+        # would deadlock two packages that share a frame, since neither could
+        # ever go first.
+        for code in self._installed_precompile_codes:
+            others = [p for p in _PRECOMPILE_INSTALLERS.get(code, ()) if p is not self]
+            if others:
+                logger.warning(
+                    "Uninstalling a CompilePackage from code object %s (%s:%d) that "
+                    "%d other loaded package(s) also installed on. Precompile "
+                    "entries can only be cleared en masse, so those packages will "
+                    "stop serving this frame and fall back to compiling it.",
+                    code.co_name,
+                    code.co_filename,
+                    code.co_firstlineno,
+                    len(others),
+                )
+
+        for code in [self._innermost_fn.__code__, *self._installed_precompile_codes]:
+            _reset_precompile_entries(code)
+            installers = _PRECOMPILE_INSTALLERS.get(code)
+            if installers is not None:
+                installers.discard(self)
+        self._installed_precompile_codes = []
 
     def install(self, backends: dict[_BackendId, Any]) -> None:
         """
@@ -952,7 +1020,10 @@ class CompilePackage:
                 if len(entry.guarded_codes) == 0:
                     # Dynamo generates empty graph for trivial functions, should just skip them
                     # in these cases.
+                    # Remember it so uninstall() can restore the frame rather
+                    # than leaving it permanently unskippable.
                     torch._dynamo.eval_frame.skip_code(target_code)
+                    self._skipped_codes.append(target_code)
 
                 for guarded_code in entry.guarded_codes:
                     with dynamo_timed("precompile_load_guards"):
@@ -988,6 +1059,11 @@ class CompilePackage:
                         guard_manager = load_guard_manager(
                             guards_state, target_code, runtime_global_scope
                         )
+                    if target_code not in self._installed_precompile_codes:
+                        self._installed_precompile_codes.append(target_code)
+                    _PRECOMPILE_INSTALLERS.setdefault(
+                        target_code, weakref.WeakSet()
+                    ).add(self)
                     _load_precompile_entry(
                         target_code,
                         guard_manager,
